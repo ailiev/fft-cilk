@@ -5,4 +5,4 @@ programming graduate course (CS 188) at Dartmouth, 2003.
 
 My program was the fastest in the class, for which I won a hand-painted puck!
 
-![Prize puck](http://cloud.github.com/downloads/ailiev/fft-cilk/cilk-prize.jpg)
+![Prize puck](http://www.iliev.org.uk/pics/cilk-prize.jpg)
