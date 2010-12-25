@@ -29,7 +29,7 @@
 #include "FFT.h"
 #include "timer.h"
 
-#include "fft.h"		/* this one from alex */
+#include "fft.cilkh"		/* this one from alex */
 
 
 
