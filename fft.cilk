@@ -1,0 +1,316 @@
+/* fft.cilk -*- c -*-
+
+   Cilk program for computing the FFT.
+
+   main function tests by making a spike vector, calling FFT, and
+   checking the result.  Args to main function are lg of the problem
+   size, followed by an optional spike position (default is 1).
+
+   To compile as the C elision, use the C flag -DNOCILK
+
+*/
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifndef NOCILK
+#include <cilk.h>
+#endif
+
+#include <assert.h>
+
+#ifdef NOCILK
+#define cilk
+#define spawn
+#define sync
+#endif
+
+#include "FFT.h"
+#include "timer.h"
+
+#include "fft.h"		/* this one from alex */
+
+
+
+/*
+ * alex iliev, feb 2003
+ * FFT is implemented as the straightforward recursive algorithm. The input
+ * array is not copied---I use a (start,stride) approach for the sub-FFT's.
+ * the output goes into *one* newly allocated array, and is copied (cilkily) at
+ * the end.
+ * Some performance numbers i got on andes with 16 processors with spike
+ * vectors:
+ * input size 2^22 takes about 2.1 s
+ *            2^23             3.8 s
+ *            2^24             7.6 s
+ *            2^25             14-15 s
+ *            2^26 fails as the output array cannot be allocated (it would need
+ *                 1 GB!)
+ */
+
+
+/* Compute the FFT of an array a of length N. */
+cilk void FFT(complex_t *a_data, int N)
+{
+    complex_t * Y;
+    stride_array_t A;
+
+    /* hopefully this malloc is constant time! */
+    Y = malloc (N * sizeof(complex_t));
+    if (!Y) {
+	perror ("Failed to allocate Y");
+	exit (EXIT_FAILURE);	/* FIXME: would be good to indicate an error
+				 * somehow else! */
+    }
+
+    /* make a stride array from a_data */
+    STRIDE_INIT_RAW (&A, a_data);
+
+    /* the main computation */
+    spawn fft_main (Y, &A, N);
+    sync;
+    
+    /* and now copy the result into the input memory */
+    spawn cilk_memcpy ( a_data, Y, N * sizeof(*a_data) );
+    sync;
+    
+    free (Y);
+
+}
+
+
+/*
+  computes the FFT of A, puts result into Y
+*/
+cilk void fft_main (complex_t * Y, stride_array_t * A, int N) {
+
+    stride_array_t A_, A__;	/* A' and A''*/
+    complex_t * Y_, * Y__;	/* Y' and Y'', to resemble the written algorithm */
+    
+
+    /* base case */
+    if (N == 1) {
+	Y[0] = STRIDE_IDX(A, 0);   /* just copy the first element */
+	return;
+    }
+
+    STRIDE_INIT (&A_,  A, 0, 2); /* the evens of A */
+    STRIDE_INIT (&A__, A, 1, 2); /* the odds       */
+
+    Y_  = Y;
+    Y__ = Y + N/2;
+    
+    spawn fft_main (Y_,  &A_,  N/2);
+    spawn fft_main (Y__, &A__, N/2);
+
+    sync;
+    
+    /* and now recombine into Y */
+    spawn cilk_recombine (Y, N, 0, N/2);
+    sync;
+
+}
+
+
+
+/*
+  linear loop for the recombination step: do the twiddles for 'size' elements
+  from 'k_start'.
+
+  'N' is the size of the whole input/output vector Y
+*/
+
+void recombine (complex_t * Y,
+		size_t N,
+		int k_start, size_t size)
+{
+    complex_t twiddle, omega, omega_n;
+    int k;
+    complex_t *Y_, *Y__;
+
+    Y_  = Y;
+    Y__ = Y+N/2;
+
+    COMPLEX_ROOT (omega_n, N, 1      );
+    COMPLEX_ROOT (omega,   N, k_start);	/* 'omega' is omega_N^k during the
+					 * iteration */
+    
+    for (k = k_start; k < k_start + size; k++) {
+	/* prepare the twiddle factor */
+	COMPLEX_MULT (twiddle, omega, Y__[k]);
+
+	/* do the two twiddles. the order is important! keep in mind that Y_[k]
+	is an alias to Y[k]
+	*/
+	COMPLEX_SUB (Y[k+N/2], Y_[k], twiddle);
+	COMPLEX_ADD (Y[k],     Y_[k], twiddle);
+
+	/* update omega */
+	COMPLEX_MULT (omega, omega, omega_n);
+    }
+}
+
+
+/*
+  recursive structure for the above recombination loop
+*/
+
+const size_t cilk_recombine_MAXLINEAR = 128;
+
+cilk void cilk_recombine (complex_t * Y,
+			  size_t N,
+			  int k_start, size_t size)
+{
+    assert (size >= 1);
+
+    if (size <= cilk_recombine_MAXLINEAR) {
+	/* base case: serial for below a fixed size */
+	recombine (Y, N, k_start, size);
+    }
+    else {
+	/* recurse further */
+	spawn cilk_recombine (Y, N, k_start,          size/2);
+	spawn cilk_recombine (Y, N, k_start + size/2, size/2);
+	sync;
+    }
+
+}
+
+
+
+
+/*
+  recursive structure for memcpy
+*/
+
+const size_t cilk_memcpy_MAXLINEAR = 128;
+
+cilk void cilk_memcpy(void *dest, const void *src, size_t n)
+{
+    /* base case: serial copy for some small fixed size */
+    if (n <= cilk_memcpy_MAXLINEAR) {
+	memcpy (dest, src, n);
+    }
+    else {
+	size_t first = n/2;
+    	spawn cilk_memcpy (dest,       src,       first);
+	spawn cilk_memcpy (dest+first, src+first, n-first);
+	sync;
+    }
+}
+
+
+
+
+
+
+
+/* Check that the result of an FFT of a spike vector is correct.  We
+   are given the resulting vector a of the FFT, its size N, and the
+   spike position.  This could have been written as a Cilk function,
+   but it's not necessary. */
+int checkFFT(complex_t *a, int N, int spike)
+{
+  complex_t target;		/* what we want to see */
+  int i;
+  int OK = 1;			/* everything's OK until we see otherwise */
+  double tolerance = 1e-9;	/* how close is close enough? */
+
+  for (i = 0; i < N; i++)
+    {
+      COMPLEX_ROOT(target, N, i * spike);
+      if ((fabs(target.real - a[i].real) > tolerance) ||
+	  (fabs(target.imag - a[i].imag > tolerance)))
+	{
+	  OK = 0;
+
+	  printf("Error in position %d: actual = (%f, %f), target = (%f, %f)\n",
+		 i, a[i].real, a[i].imag, target.real, target.imag);
+
+	}
+    }
+
+  return OK;
+}
+
+
+/* Make vector a, of length N, be a spike vector, with a given spike
+   position.  This could have been written as a Cilk function, but
+   it's not necessary. */
+void makeSpike(complex_t *a, int N, int spike)
+{
+  int i;
+  complex_t zero = { 0.0, 0.0 };
+
+  for (i = 0; i < N; i++)
+    a[i] = zero;
+
+  a[spike].real = 1.0;
+}
+
+
+/* Debugging function to print a vector a of length N.  VERY useful. */
+void printv(complex_t *a, int N)
+{
+  int i;
+
+  for (i = 0; i < N; i++)
+    printf("%d: (%f, %f)\n", i, a[i].real, a[i].imag);
+}
+
+
+/* Driver to test the Cilk FFT function. */
+cilk int main(int argc, char **argv)
+{
+  int N, spike;			/* vector length and spike position */
+  complex_t *a;			/* the vector */
+  cs88_timer_t timer;		/* a timer */
+
+  /* Make sure we at least have lg of vector length on command line. */
+  if (argc < 2)
+    {
+      printf("Usage: %s lgN [spike]\n", argv[0]);
+      exit(1);
+    }
+
+  /* We do.  Grab it, convert it to the vector length, and save it. */
+  N = 1 << atoi(argv[1]);
+
+  /* Grab the spike position if there is one.  Otherwise, use the
+     default of 1. */
+  if (argc >= 3)
+    spike = atoi(argv[2]);
+  else
+    spike = 1;
+
+  /* Now we can allocate the vector... */
+  a = malloc(N * sizeof(complex_t));
+
+  /* ...and make the spike...*/
+  makeSpike(a, N, spike);
+
+  /* Start the timer. */
+  TIMER_RESET(timer);
+  TIMER_START(timer);  
+
+  /* ...and FFT it... */
+  spawn FFT(a, N);
+  sync;
+
+  /* Stop the timer. */
+  TIMER_STOP(timer);
+
+  /* ...and see how we did... */
+  if (checkFFT(a, N, spike))
+    printf("Answer is OK!\n");
+  else
+    printf("Bad answer!\n");
+
+  printf("Time = %f\n", TIMER_EVAL(timer));
+
+  /* ...and go have milk and cookies! */
+  free(a);
+
+  return 0;
+}
